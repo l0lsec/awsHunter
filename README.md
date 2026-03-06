@@ -13,7 +13,7 @@ A comprehensive bash script for testing AWS security misconfigurations, credenti
 
 **Sedric Louissaint**  
 🐦 Twitter: [@l0lsec](https://twitter.com/l0lsec)  
-💻 GitHub: ShowUpShowOut
+💻 GitHub: l0lsec
 
 ---
 
@@ -309,7 +309,7 @@ This tool is provided for educational and authorized security testing purposes o
 
 ## Acknowledgments
 
-Created by **Sedric Louissaint** ([@l0lsec](https://twitter.com/l0lsec) | ShowUpShowOut)
+Created by **Sedric Louissaint** ([@l0lsec](https://twitter.com/sedric____) | ShowUpShowOut)
 
 *"Security is not a product, but a process."*
 
