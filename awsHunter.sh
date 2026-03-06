@@ -206,6 +206,17 @@ Options:
     --test-create           Enable destructive tests (attempt to create resources)
                             WARNING: This will create test resources in the target account
 
+Cognito User Pool Client Auth:
+    --client-id ID          Cognito App Client ID
+    --client-secret SECRET  Cognito App Client Secret
+    --token-url URL         OAuth2 token endpoint URL
+                            (e.g., https://mydomain.auth.us-east-2.amazoncognito.com/oauth2/token)
+    --username USER         Cognito username (for USER_PASSWORD_AUTH flow)
+    --password PASS         Cognito password (for USER_PASSWORD_AUTH flow)
+    --user-pool-id ID       Cognito User Pool ID (e.g., us-east-1_AbCdEfG)
+                            Required for --username/--password flow.
+                            Optional for --token-url client_credentials flow.
+
 Service Selection:
     --service SERVICES      Comma-separated list of services to test (e.g., s3,lambda,dynamodb)
     --service-category CAT  Test all services in specified categories (e.g., database,secrets)
@@ -240,6 +251,20 @@ Examples:
 
     # List all available services
     $0 --list-services
+
+    # Get Bearer token with Cognito client credentials (no IAM keys needed)
+    $0 --client-id ABC123 --client-secret SECRETXYZ \\
+       --token-url https://mydomain.auth.us-east-2.amazoncognito.com/oauth2/token
+
+    # Client credentials + probe a specific API Gateway
+    API_BASE_URL=https://xxxxx.execute-api.us-east-2.amazonaws.com \\
+    $0 --client-id ABC123 --client-secret SECRETXYZ \\
+       --token-url https://mydomain.auth.us-east-2.amazoncognito.com/oauth2/token
+
+    # User Pool auth with username/password (exchanges for IAM creds)
+    $0 --client-id ABC123 --client-secret SECRETXYZ \\
+       --username user@example.com --password 'P@ssw0rd!' \\
+       --user-pool-id us-east-1_AbCdEfG -p us-east-1:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 Environment Variables:
     AWS_ACCESS_KEY_ID       AWS Access Key ID
@@ -582,6 +607,30 @@ while [[ $# -gt 0 ]]; do
             SELECTED_CATEGORIES="$2"
             shift 2
             ;;
+        --client-id)
+            COGNITO_CLIENT_ID="$2"
+            shift 2
+            ;;
+        --client-secret)
+            COGNITO_CLIENT_SECRET="$2"
+            shift 2
+            ;;
+        --username)
+            COGNITO_USERNAME="$2"
+            shift 2
+            ;;
+        --password)
+            COGNITO_PASSWORD="$2"
+            shift 2
+            ;;
+        --user-pool-id)
+            COGNITO_USER_POOL_ID="$2"
+            shift 2
+            ;;
+        --token-url)
+            COGNITO_TOKEN_URL="$2"
+            shift 2
+            ;;
         --list-services)
             list_services
             ;;
@@ -592,6 +641,32 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Validate Cognito client auth flag combinations
+if [ -n "$COGNITO_CLIENT_ID" ]; then
+    if [ -z "$COGNITO_CLIENT_SECRET" ]; then
+        print_error "--client-id requires --client-secret"
+        exit 1
+    fi
+    if [ -n "$COGNITO_USERNAME" ] && [ -z "$COGNITO_PASSWORD" ]; then
+        print_error "--username requires --password"
+        exit 1
+    fi
+    if [ -z "$COGNITO_USERNAME" ] && [ -n "$COGNITO_PASSWORD" ]; then
+        print_error "--password requires --username"
+        exit 1
+    fi
+    # USER_PASSWORD_AUTH needs a User Pool ID to build the provider string
+    if [ -n "$COGNITO_USERNAME" ] && [ -z "$COGNITO_USER_POOL_ID" ]; then
+        print_error "--username/--password flow requires --user-pool-id"
+        exit 1
+    fi
+    # client_credentials flow without --token-url needs --user-pool-id for domain discovery
+    if [ -z "$COGNITO_USERNAME" ] && [ -z "$COGNITO_TOKEN_URL" ] && [ -z "$COGNITO_USER_POOL_ID" ]; then
+        print_error "Provide --token-url or --user-pool-id so the OAuth2 endpoint can be determined"
+        exit 1
+    fi
+fi
 
 # Parse service selection if specified
 if [ -n "$SELECTED_SERVICES" ]; then
@@ -709,6 +784,635 @@ test_cognito_unauth_access() {
     fi
 }
 
+test_cognito_client_auth() {
+    print_section "COGNITO USER POOL CLIENT AUTHENTICATION"
+
+    print_info "Client ID: $COGNITO_CLIENT_ID"
+    print_info "User Pool ID: $COGNITO_USER_POOL_ID"
+    [ -n "$COGNITO_USERNAME" ] && print_info "Username: $COGNITO_USERNAME"
+
+    local id_token=""
+
+    if [ -n "$COGNITO_USERNAME" ] && [ -n "$COGNITO_PASSWORD" ]; then
+        # USER_PASSWORD_AUTH flow
+        print_info "Attempting USER_PASSWORD_AUTH flow..."
+
+        local auth_params="USERNAME=${COGNITO_USERNAME},PASSWORD=${COGNITO_PASSWORD}"
+
+        if [ -n "$COGNITO_CLIENT_SECRET" ]; then
+            local secret_hash
+            secret_hash=$(printf '%s' "${COGNITO_USERNAME}${COGNITO_CLIENT_ID}" \
+                | openssl dgst -sha256 -hmac "$COGNITO_CLIENT_SECRET" -binary \
+                | base64)
+            auth_params="${auth_params},SECRET_HASH=${secret_hash}"
+        fi
+
+        echo -n "Authenticating... "
+        AUTH_RESULT=$(aws cognito-idp initiate-auth \
+            --client-id "$COGNITO_CLIENT_ID" \
+            --auth-flow USER_PASSWORD_AUTH \
+            --auth-parameters "$auth_params" \
+            --region "$AWS_REGION" 2>&1)
+
+        if echo "$AUTH_RESULT" | grep -q "AuthenticationResult"; then
+            print_success "Authentication successful!"
+            print_finding "Cognito User Pool accepted credentials!"
+
+            echo "$AUTH_RESULT" > "$OUTPUT_DIR/cognito_client_auth.json"
+
+            id_token=$(echo "$AUTH_RESULT" | jq -r '.AuthenticationResult.IdToken')
+            local access_token
+            access_token=$(echo "$AUTH_RESULT" | jq -r '.AuthenticationResult.AccessToken')
+
+            print_info "ID Token obtained (${#id_token} chars)"
+            print_info "Access Token obtained (${#access_token} chars)"
+
+            if echo "$AUTH_RESULT" | jq -e '.AuthenticationResult.NewDeviceMetadata' >/dev/null 2>&1; then
+                print_warning "New device metadata returned - MFA may be configured"
+            fi
+        elif echo "$AUTH_RESULT" | grep -q "ChallengeName"; then
+            local challenge
+            challenge=$(echo "$AUTH_RESULT" | jq -r '.ChallengeName')
+            print_warning "Auth challenge required: $challenge"
+            print_info "Challenges like NEW_PASSWORD_REQUIRED, MFA_SETUP, SMS_MFA need interactive handling"
+            echo "$AUTH_RESULT" > "$OUTPUT_DIR/cognito_auth_challenge.json"
+            return 1
+        else
+            print_error "Authentication failed: $AUTH_RESULT"
+            return 1
+        fi
+    else
+        # Client credentials (OAuth2) flow — no username/password
+        print_info "No username/password provided. Attempting client_credentials OAuth2 flow..."
+
+        local domain_url=""
+
+        if [ -n "$COGNITO_TOKEN_URL" ]; then
+            domain_url="$COGNITO_TOKEN_URL"
+        else
+            local token_endpoint
+            token_endpoint=$(aws cognito-idp describe-user-pool \
+                --user-pool-id "$COGNITO_USER_POOL_ID" \
+                --region "$AWS_REGION" \
+                --query 'UserPool.Domain' --output text 2>&1)
+
+            if [ -n "$token_endpoint" ] && [ "$token_endpoint" != "None" ]; then
+                domain_url="https://${token_endpoint}.auth.${AWS_REGION}.amazoncognito.com/oauth2/token"
+            else
+                print_error "Could not determine User Pool domain for OAuth2 endpoint"
+                print_info "Provide --token-url with the full OAuth2 token URL"
+                print_info "  e.g., --token-url https://mydomain.auth.us-east-2.amazoncognito.com/oauth2/token"
+                print_info "Or provide --username and --password for USER_PASSWORD_AUTH flow instead"
+                return 1
+            fi
+        fi
+
+        local basic_auth
+        basic_auth=$(printf '%s:%s' "$COGNITO_CLIENT_ID" "$COGNITO_CLIENT_SECRET" | base64)
+
+        print_info "Token endpoint: $domain_url"
+        echo -n "Requesting client_credentials grant... "
+
+        local token_result
+        token_result=$(curl -s -X POST "$domain_url" \
+            -H "Authorization: Basic ${basic_auth}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials" 2>&1)
+
+        if echo "$token_result" | jq -e '.access_token' >/dev/null 2>&1; then
+            print_success "Client credentials grant successful!"
+            OAUTH2_ACCESS_TOKEN=$(echo "$token_result" | jq -r '.access_token')
+            OAUTH2_TOKEN_URL="$domain_url"
+            print_info "Access Token obtained (${#OAUTH2_ACCESS_TOKEN} chars)"
+            echo "$token_result" > "$OUTPUT_DIR/cognito_oauth2_token.json"
+
+            local expires_in
+            expires_in=$(echo "$token_result" | jq -r '.expires_in // empty')
+            [ -n "$expires_in" ] && print_info "Token expires in: ${expires_in}s"
+
+            print_info "Token type: client_credentials (Bearer)"
+            print_warning "This token cannot be exchanged for IAM credentials (no IdToken)"
+            print_info "Will probe APIs accessible with this Bearer token"
+            return 0
+        else
+            print_error "Client credentials grant failed: $token_result"
+            return 1
+        fi
+    fi
+
+    # Exchange IdToken for AWS credentials via Identity Pool
+    if [ -z "$COGNITO_IDENTITY_POOL_ID" ]; then
+        print_warning "No Identity Pool ID (-p) provided"
+        print_warning "Cannot exchange tokens for AWS credentials without an Identity Pool"
+        print_info "IdToken saved — provide -p <identity-pool-id> to get AWS credentials"
+        return 1
+    fi
+
+    local provider="cognito-idp.${AWS_REGION}.amazonaws.com/${COGNITO_USER_POOL_ID}"
+    print_info "Exchanging IdToken via Identity Pool..."
+    print_info "Provider: $provider"
+
+    echo -n "Getting identity ID (authenticated)... "
+    local id_result
+    id_result=$(aws cognito-identity get-id \
+        --identity-pool-id "$COGNITO_IDENTITY_POOL_ID" \
+        --logins "{\"${provider}\": \"${id_token}\"}" \
+        --region "$AWS_REGION" 2>&1)
+
+    if echo "$id_result" | grep -q "IdentityId"; then
+        local identity_id
+        identity_id=$(echo "$id_result" | jq -r '.IdentityId')
+        print_success "Got authenticated Identity ID: $identity_id"
+
+        echo -n "Getting AWS credentials for authenticated identity... "
+        local creds_result
+        creds_result=$(aws cognito-identity get-credentials-for-identity \
+            --identity-id "$identity_id" \
+            --logins "{\"${provider}\": \"${id_token}\"}" \
+            --region "$AWS_REGION" 2>&1)
+
+        if echo "$creds_result" | grep -q "Credentials"; then
+            print_success "Got temporary AWS credentials!"
+            print_finding "Authenticated Cognito credentials obtained!"
+
+            echo "$creds_result" > "$OUTPUT_DIR/cognito_authenticated_credentials.json"
+
+            COGNITO_ACCESS_KEY=$(echo "$creds_result" | jq -r '.Credentials.AccessKeyId')
+            COGNITO_SECRET_KEY=$(echo "$creds_result" | jq -r '.Credentials.SecretKey')
+            COGNITO_SESSION_TOKEN=$(echo "$creds_result" | jq -r '.Credentials.SessionToken')
+            local expiration
+            expiration=$(echo "$creds_result" | jq -r '.Credentials.Expiration')
+
+            print_info "Access Key: $COGNITO_ACCESS_KEY"
+            print_info "Expiration: $expiration"
+
+            return 0
+        else
+            print_error "Failed to get credentials for authenticated identity: $creds_result"
+            return 1
+        fi
+    else
+        print_error "Failed to get authenticated identity: $id_result"
+        return 1
+    fi
+}
+
+enumerate_with_bearer_token() {
+    print_section "BEARER TOKEN ENUMERATION"
+
+    print_info "Enumerating access using OAuth2 Bearer token"
+    print_info "Token length: ${#OAUTH2_ACCESS_TOKEN} chars"
+
+    # --- Decode JWT claims ---
+    print_section "JWT TOKEN ANALYSIS"
+    local jwt_payload
+    jwt_payload=$(echo "$OAUTH2_ACCESS_TOKEN" | cut -d'.' -f2)
+
+    # Fix base64 padding
+    local padded="$jwt_payload"
+    local mod=$((${#padded} % 4))
+    if [ "$mod" -eq 2 ]; then padded="${padded}==";
+    elif [ "$mod" -eq 3 ]; then padded="${padded}="; fi
+
+    local decoded_claims
+    decoded_claims=$(echo "$padded" | base64 -d 2>/dev/null)
+
+    if [ -n "$decoded_claims" ] && echo "$decoded_claims" | jq . >/dev/null 2>&1; then
+        print_success "JWT decoded successfully"
+        echo "$decoded_claims" | jq . > "$OUTPUT_DIR/jwt_claims.json"
+        echo "$decoded_claims" | jq .
+
+        local issuer client_id token_use scopes sub exp
+        issuer=$(echo "$decoded_claims" | jq -r '.iss // empty')
+        client_id=$(echo "$decoded_claims" | jq -r '.client_id // empty')
+        token_use=$(echo "$decoded_claims" | jq -r '.token_use // empty')
+        scopes=$(echo "$decoded_claims" | jq -r '.scope // empty')
+        sub=$(echo "$decoded_claims" | jq -r '.sub // empty')
+        exp=$(echo "$decoded_claims" | jq -r '.exp // empty')
+
+        [ -n "$issuer" ] && print_info "Issuer: $issuer"
+        [ -n "$client_id" ] && print_info "Client ID: $client_id"
+        [ -n "$token_use" ] && print_info "Token use: $token_use"
+        [ -n "$sub" ] && print_info "Subject: $sub"
+        if [ -n "$scopes" ]; then
+            print_finding "Scopes: $scopes"
+            echo "$scopes" > "$OUTPUT_DIR/token_scopes.txt"
+        fi
+        if [ -n "$exp" ]; then
+            local exp_date
+            exp_date=$(date -r "$exp" 2>/dev/null || date -d "@$exp" 2>/dev/null || echo "unknown")
+            print_info "Expires: $exp_date"
+        fi
+
+        # Extract User Pool region and ID from issuer
+        if [[ "$issuer" =~ cognito-idp\.([^.]+)\.amazonaws\.com/(.+) ]]; then
+            discovered_pool_region="${BASH_REMATCH[1]}"
+            discovered_pool_id="${BASH_REMATCH[2]}"
+            discovered_issuer="$issuer"
+            print_finding "User Pool Region: $discovered_pool_region"
+            print_finding "User Pool ID: $discovered_pool_id"
+        fi
+    else
+        print_warning "Could not decode JWT payload (may be an opaque token)"
+    fi
+
+    # --- Derive base URL from token URL for API probing ---
+    local base_domain=""
+    if [ -n "$OAUTH2_TOKEN_URL" ]; then
+        base_domain=$(echo "$OAUTH2_TOKEN_URL" | sed 's|/oauth2/token||' | sed 's|/$||')
+    fi
+
+    # --- Probe Cognito userInfo endpoint ---
+    print_section "COGNITO USERINFO PROBE"
+
+    local userinfo_url=""
+    if [ -n "$base_domain" ]; then
+        userinfo_url="${base_domain}/oauth2/userInfo"
+    fi
+
+    if [ -n "$userinfo_url" ]; then
+        print_info "Testing: $userinfo_url"
+        echo -n "Probing userInfo... "
+        local userinfo_result
+        userinfo_result=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer ${OAUTH2_ACCESS_TOKEN}" \
+            "$userinfo_url" 2>&1)
+
+        local userinfo_body userinfo_code
+        userinfo_code=$(echo "$userinfo_result" | tail -1)
+        userinfo_body=$(echo "$userinfo_result" | sed '$d')
+
+        if [ "$userinfo_code" = "200" ]; then
+            print_success "userInfo accessible! (HTTP $userinfo_code)"
+            print_finding "User info retrieved:"
+            echo "$userinfo_body" | jq . 2>/dev/null || echo "$userinfo_body"
+            echo "$userinfo_body" > "$OUTPUT_DIR/cognito_userinfo.json"
+        else
+            print_info "userInfo returned HTTP $userinfo_code (expected for client_credentials tokens)"
+        fi
+    fi
+
+    # --- Probe well-known OIDC configuration ---
+    print_section "OIDC DISCOVERY"
+
+    if [ -n "$base_domain" ]; then
+        local wellknown_url="${base_domain}/.well-known/openid-configuration"
+        print_info "Testing: $wellknown_url"
+        echo -n "Fetching OIDC config... "
+        local oidc_result
+        oidc_result=$(curl -s -w "\n%{http_code}" "$wellknown_url" 2>&1)
+
+        local oidc_body oidc_code
+        oidc_code=$(echo "$oidc_result" | tail -1)
+        oidc_body=$(echo "$oidc_result" | sed '$d')
+
+        if [ "$oidc_code" = "200" ]; then
+            print_success "OIDC discovery document found!"
+            echo "$oidc_body" | jq . 2>/dev/null || echo "$oidc_body"
+            echo "$oidc_body" > "$OUTPUT_DIR/oidc_configuration.json"
+
+            local supported_scopes
+            supported_scopes=$(echo "$oidc_body" | jq -r '.scopes_supported[]?' 2>/dev/null | tr '\n' ', ')
+            [ -n "$supported_scopes" ] && print_finding "Supported scopes: $supported_scopes"
+
+            local token_endpoint_from_oidc
+            token_endpoint_from_oidc=$(echo "$oidc_body" | jq -r '.token_endpoint // empty' 2>/dev/null)
+            [ -n "$token_endpoint_from_oidc" ] && print_info "Token endpoint: $token_endpoint_from_oidc"
+
+            local auth_endpoint
+            auth_endpoint=$(echo "$oidc_body" | jq -r '.authorization_endpoint // empty' 2>/dev/null)
+            [ -n "$auth_endpoint" ] && print_info "Authorization endpoint: $auth_endpoint"
+        else
+            print_info "No OIDC config at $wellknown_url (HTTP $oidc_code)"
+        fi
+    fi
+
+    # --- Cognito User Pool Misconfiguration Probing ---
+    if [ -n "$discovered_pool_id" ]; then
+        print_section "COGNITO USER POOL MISCONFIGURATION PROBING"
+
+        local probe_region="${discovered_pool_region:-$AWS_REGION}"
+        local probe_client_id="${COGNITO_CLIENT_ID}"
+
+        print_info "User Pool ID: $discovered_pool_id"
+        print_info "Region: $probe_region"
+        print_info "Client ID: $probe_client_id"
+
+        # --- JWKS signing keys ---
+        if [ -n "$discovered_issuer" ]; then
+            local jwks_url="${discovered_issuer}/.well-known/jwks.json"
+            print_info "Fetching JWKS: $jwks_url"
+            echo -n "Getting signing keys... "
+            local jwks_result
+            jwks_result=$(curl -s -w "\n%{http_code}" "$jwks_url" 2>&1)
+
+            local jwks_body jwks_code
+            jwks_code=$(echo "$jwks_result" | tail -1)
+            jwks_body=$(echo "$jwks_result" | sed '$d')
+
+            if [ "$jwks_code" = "200" ]; then
+                print_success "JWKS retrieved!"
+                echo "$jwks_body" | jq . 2>/dev/null || echo "$jwks_body"
+                echo "$jwks_body" > "$OUTPUT_DIR/cognito_jwks.json"
+
+                local key_count
+                key_count=$(echo "$jwks_body" | jq '.keys | length' 2>/dev/null)
+                print_info "Signing keys found: $key_count"
+
+                local key_types
+                key_types=$(echo "$jwks_body" | jq -r '.keys[].kty' 2>/dev/null | sort -u | tr '\n' ', ')
+                [ -n "$key_types" ] && print_info "Key types: $key_types"
+            else
+                print_info "JWKS not accessible (HTTP $jwks_code)"
+            fi
+        fi
+
+        # --- Test self-registration (sign-up) ---
+        print_info "Testing if self-registration is enabled..."
+        echo -n "Probing sign-up... "
+
+        local signup_result
+        signup_result=$(aws cognito-idp sign-up \
+            --client-id "$probe_client_id" \
+            --username "awshunter-probe-test@example.com" \
+            --password 'AWSHunter!Probe1' \
+            --region "$probe_region" \
+            --no-sign-request 2>&1)
+
+        if echo "$signup_result" | grep -qi "UserSub\|CodeDeliveryDetails\|UsernameExistsException"; then
+            if echo "$signup_result" | grep -qi "UsernameExistsException"; then
+                print_finding "Self-registration is ENABLED (username already exists response)"
+                print_finding "User enumeration possible via sign-up"
+            else
+                print_finding "Self-registration is ENABLED and sign-up succeeded!"
+                print_warning "A test account may have been created - notify client"
+            fi
+            echo "$signup_result" > "$OUTPUT_DIR/cognito_signup_probe.json"
+        elif echo "$signup_result" | grep -qi "NotAuthorizedException.*client secret"; then
+            print_info "Sign-up requires SECRET_HASH (client has a secret configured)"
+
+            # Retry with SECRET_HASH
+            if [ -n "$COGNITO_CLIENT_SECRET" ]; then
+                local signup_hash
+                signup_hash=$(printf '%s' "awshunter-probe-test@example.com${probe_client_id}" \
+                    | openssl dgst -sha256 -hmac "$COGNITO_CLIENT_SECRET" -binary | base64)
+
+                signup_result=$(aws cognito-idp sign-up \
+                    --client-id "$probe_client_id" \
+                    --username "awshunter-probe-test@example.com" \
+                    --password 'AWSHunter!Probe1' \
+                    --secret-hash "$signup_hash" \
+                    --region "$probe_region" \
+                    --no-sign-request 2>&1)
+
+                if echo "$signup_result" | grep -qi "UserSub\|CodeDeliveryDetails\|UsernameExistsException"; then
+                    if echo "$signup_result" | grep -qi "UsernameExistsException"; then
+                        print_finding "Self-registration is ENABLED (with secret hash)"
+                        print_finding "User enumeration possible via sign-up"
+                    else
+                        print_finding "Self-registration is ENABLED (with secret hash) and sign-up succeeded!"
+                        print_warning "A test account may have been created - notify client"
+                    fi
+                    echo "$signup_result" > "$OUTPUT_DIR/cognito_signup_probe.json"
+                elif echo "$signup_result" | grep -qi "InvalidPasswordException"; then
+                    print_finding "Self-registration is ENABLED (password policy rejected probe password)"
+                    echo "$signup_result" > "$OUTPUT_DIR/cognito_signup_probe.json"
+                else
+                    print_info "Sign-up not available: $(echo "$signup_result" | head -1)"
+                fi
+            fi
+        elif echo "$signup_result" | grep -qi "InvalidPasswordException"; then
+            print_finding "Self-registration is ENABLED (password policy rejected probe password)"
+            echo "$signup_result" > "$OUTPUT_DIR/cognito_signup_probe.json"
+        else
+            print_info "Sign-up response: $(echo "$signup_result" | head -1)"
+        fi
+
+        # --- Test user enumeration via forgot-password ---
+        print_info "Testing forgot-password for user enumeration..."
+        echo -n "Probing forgot-password... "
+
+        local forgot_result
+        local test_users=("admin" "admin@example.com" "test" "developer" "user")
+
+        for test_user in "${test_users[@]}"; do
+            local forgot_cmd_result
+
+            if [ -n "$COGNITO_CLIENT_SECRET" ]; then
+                local forgot_hash
+                forgot_hash=$(printf '%s' "${test_user}${probe_client_id}" \
+                    | openssl dgst -sha256 -hmac "$COGNITO_CLIENT_SECRET" -binary | base64)
+
+                forgot_cmd_result=$(aws cognito-idp forgot-password \
+                    --client-id "$probe_client_id" \
+                    --username "$test_user" \
+                    --secret-hash "$forgot_hash" \
+                    --region "$probe_region" \
+                    --no-sign-request 2>&1)
+            else
+                forgot_cmd_result=$(aws cognito-idp forgot-password \
+                    --client-id "$probe_client_id" \
+                    --username "$test_user" \
+                    --region "$probe_region" \
+                    --no-sign-request 2>&1)
+            fi
+
+            if echo "$forgot_cmd_result" | grep -qi "CodeDeliveryDetails"; then
+                print_finding "User EXISTS: '$test_user' (forgot-password sent reset code)"
+                echo "CONFIRMED_USER: $test_user" >> "$OUTPUT_DIR/cognito_user_enum.txt"
+                echo "$forgot_cmd_result" >> "$OUTPUT_DIR/cognito_forgot_password_probe.json"
+            elif echo "$forgot_cmd_result" | grep -qi "UserNotFoundException"; then
+                echo -n "."
+            elif echo "$forgot_cmd_result" | grep -qi "LimitExceededException"; then
+                print_warning "Rate limited - stopping user enumeration"
+                break
+            elif echo "$forgot_cmd_result" | grep -qi "NotAuthorizedException"; then
+                print_info "forgot-password not allowed for this client"
+                break
+            elif echo "$forgot_cmd_result" | grep -qi "InvalidParameterException"; then
+                print_info "forgot-password requires verified contact info"
+                break
+            else
+                echo -n "."
+            fi
+        done
+        echo ""
+
+        if [ -f "$OUTPUT_DIR/cognito_user_enum.txt" ]; then
+            local enum_count
+            enum_count=$(wc -l < "$OUTPUT_DIR/cognito_user_enum.txt" | tr -d ' ')
+            print_finding "Enumerated $enum_count valid user(s)"
+            print_info "Results saved to $OUTPUT_DIR/cognito_user_enum.txt"
+        else
+            print_info "No users enumerated via forgot-password"
+        fi
+
+        # --- Test describe-user-pool-client (requires IAM, but worth trying) ---
+        print_info "Attempting to describe user pool client..."
+        echo -n "Probing describe-user-pool-client... "
+        local describe_client_result
+        describe_client_result=$(aws cognito-idp describe-user-pool-client \
+            --user-pool-id "$discovered_pool_id" \
+            --client-id "$probe_client_id" \
+            --region "$probe_region" 2>&1)
+
+        if echo "$describe_client_result" | grep -qi "ClientId"; then
+            print_finding "User Pool client details accessible!"
+            echo "$describe_client_result" | jq . 2>/dev/null || echo "$describe_client_result"
+            echo "$describe_client_result" > "$OUTPUT_DIR/cognito_client_details.json"
+
+            local callback_urls
+            callback_urls=$(echo "$describe_client_result" | jq -r '.UserPoolClient.CallbackURLs[]?' 2>/dev/null)
+            if [ -n "$callback_urls" ]; then
+                print_finding "Callback URLs found:"
+                echo "$callback_urls" | while read -r url; do echo "  - $url"; done
+                echo "$callback_urls" > "$OUTPUT_DIR/cognito_callback_urls.txt"
+            fi
+
+            local allowed_flows
+            allowed_flows=$(echo "$describe_client_result" | jq -r '.UserPoolClient.ExplicitAuthFlows[]?' 2>/dev/null)
+            if [ -n "$allowed_flows" ]; then
+                print_finding "Allowed auth flows:"
+                echo "$allowed_flows" | while read -r flow; do echo "  - $flow"; done
+            fi
+
+            local allowed_scopes
+            allowed_scopes=$(echo "$describe_client_result" | jq -r '.UserPoolClient.AllowedOAuthScopes[]?' 2>/dev/null)
+            if [ -n "$allowed_scopes" ]; then
+                print_finding "Allowed OAuth scopes:"
+                echo "$allowed_scopes" | while read -r scope; do echo "  - $scope"; done
+            fi
+        else
+            print_info "describe-user-pool-client not accessible (expected without IAM creds)"
+        fi
+
+        # --- Try listing user pool clients ---
+        print_info "Attempting to list user pool clients..."
+        echo -n "Probing list-user-pool-clients... "
+        local list_clients_result
+        list_clients_result=$(aws cognito-idp list-user-pool-clients \
+            --user-pool-id "$discovered_pool_id" \
+            --region "$probe_region" 2>&1)
+
+        if echo "$list_clients_result" | grep -qi "UserPoolClients"; then
+            print_finding "User Pool clients enumerated!"
+            echo "$list_clients_result" | jq . 2>/dev/null || echo "$list_clients_result"
+            echo "$list_clients_result" > "$OUTPUT_DIR/cognito_pool_clients.json"
+
+            local client_count
+            client_count=$(echo "$list_clients_result" | jq '.UserPoolClients | length' 2>/dev/null)
+            print_finding "Found $client_count app client(s) in the User Pool"
+        else
+            print_info "list-user-pool-clients not accessible (expected without IAM creds)"
+        fi
+    fi
+
+    # --- Probe API Gateway endpoints ---
+    print_section "API GATEWAY ENDPOINT PROBING"
+
+    local api_base_urls=()
+
+    # Derive potential API Gateway base URLs from the token URL domain
+    if [ -n "$OAUTH2_TOKEN_URL" ]; then
+        local token_domain
+        token_domain=$(echo "$OAUTH2_TOKEN_URL" | sed 's|https://||' | cut -d'/' -f1 | cut -d'.' -f1)
+        local token_region
+        token_region=$(echo "$OAUTH2_TOKEN_URL" | sed -n 's|.*\.auth\.\([^.]*\)\.amazoncognito.*|\1|p')
+
+        if [ -n "$token_region" ]; then
+            print_info "Detected region from token URL: $token_region"
+            print_info "Scanning for API Gateway endpoints in $token_region"
+        fi
+    fi
+
+    # Common API Gateway stage paths to probe
+    local stage_paths=("prod" "dev" "staging" "test" "api" "v1" "v2" "default" "stage")
+
+    # If user provided --api-url or we can find API Gateway URLs, probe them
+    if [ ${#api_base_urls[@]} -eq 0 ]; then
+        print_info "No API Gateway base URLs discovered automatically"
+        print_info "To probe a specific API, re-run with environment variable:"
+        print_info "  API_BASE_URL=https://xxxxx.execute-api.region.amazonaws.com ./awsHunter.sh ..."
+    fi
+
+    # Check for API_BASE_URL env var
+    if [ -n "${API_BASE_URL:-}" ]; then
+        api_base_urls+=("$API_BASE_URL")
+    fi
+
+    local api_findings=0
+    for api_url in "${api_base_urls[@]}"; do
+        local clean_url
+        clean_url=$(echo "$api_url" | sed 's|/$||')
+        print_info "Probing API: $clean_url"
+
+        for stage in "${stage_paths[@]}"; do
+            local probe_url="${clean_url}/${stage}"
+            echo -n "  Testing ${stage}... "
+            local probe_result
+            probe_result=$(curl -s -o /dev/null -w "%{http_code}" \
+                -H "Authorization: Bearer ${OAUTH2_ACCESS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                "$probe_url" 2>&1)
+
+            if [ "$probe_result" = "200" ] || [ "$probe_result" = "201" ] || [ "$probe_result" = "403" ]; then
+                if [ "$probe_result" = "403" ]; then
+                    print_warning "${probe_url} -> HTTP $probe_result (exists but forbidden)"
+                else
+                    print_finding "${probe_url} -> HTTP $probe_result (ACCESSIBLE)"
+                fi
+                ((api_findings++))
+
+                # Fetch full response for accessible endpoints
+                if [ "$probe_result" != "403" ]; then
+                    local full_response
+                    full_response=$(curl -s \
+                        -H "Authorization: Bearer ${OAUTH2_ACCESS_TOKEN}" \
+                        -H "Content-Type: application/json" \
+                        "$probe_url" 2>&1)
+                    local safe_stage
+                    safe_stage=$(echo "$stage" | tr '/' '_')
+                    echo "$full_response" > "$OUTPUT_DIR/api_${safe_stage}_response.json"
+                fi
+            elif [ "$probe_result" = "401" ]; then
+                echo "HTTP $probe_result (unauthorized)"
+            elif [ "$probe_result" = "404" ]; then
+                echo "HTTP $probe_result (not found)"
+            else
+                echo "HTTP $probe_result"
+            fi
+        done
+    done
+
+    # --- Summary ---
+    print_section "BEARER TOKEN ENUMERATION SUMMARY"
+
+    echo ""
+    print_info "Token file: $OUTPUT_DIR/cognito_oauth2_token.json"
+    [ -f "$OUTPUT_DIR/jwt_claims.json" ] && print_info "JWT claims: $OUTPUT_DIR/jwt_claims.json"
+    [ -f "$OUTPUT_DIR/token_scopes.txt" ] && print_info "Scopes: $OUTPUT_DIR/token_scopes.txt"
+    [ -f "$OUTPUT_DIR/cognito_userinfo.json" ] && print_info "User info: $OUTPUT_DIR/cognito_userinfo.json"
+    [ -f "$OUTPUT_DIR/oidc_configuration.json" ] && print_info "OIDC config: $OUTPUT_DIR/oidc_configuration.json"
+    [ -f "$OUTPUT_DIR/cognito_jwks.json" ] && print_info "JWKS keys: $OUTPUT_DIR/cognito_jwks.json"
+    [ -f "$OUTPUT_DIR/cognito_user_enum.txt" ] && print_info "Enumerated users: $OUTPUT_DIR/cognito_user_enum.txt"
+    [ -f "$OUTPUT_DIR/cognito_signup_probe.json" ] && print_info "Sign-up probe: $OUTPUT_DIR/cognito_signup_probe.json"
+    [ -f "$OUTPUT_DIR/cognito_client_details.json" ] && print_info "Client details: $OUTPUT_DIR/cognito_client_details.json"
+    [ -f "$OUTPUT_DIR/cognito_pool_clients.json" ] && print_info "Pool clients: $OUTPUT_DIR/cognito_pool_clients.json"
+
+    echo ""
+    print_info "To use this token manually:"
+    echo "  export ACCESS_TOKEN='${OAUTH2_ACCESS_TOKEN:0:20}...'"
+    echo "  curl -H \"Authorization: Bearer \$ACCESS_TOKEN\" https://your-api-endpoint/"
+    echo ""
+    print_info "To probe a specific API Gateway endpoint:"
+    echo "  API_BASE_URL=https://xxxxx.execute-api.region.amazonaws.com \\"
+    echo "    ./awsHunter.sh --client-id ... --client-secret ... --token-url ..."
+
+    if [ "$api_findings" -gt 0 ]; then
+        print_finding "Found $api_findings accessible/existing API endpoints"
+    fi
+}
+
 setup_credentials() {
     print_section "SETTING UP AWS CREDENTIALS"
     
@@ -724,7 +1428,11 @@ setup_credentials() {
         export AWS_SECRET_ACCESS_KEY="$DECODED_SECRET_KEY"
         unset AWS_SESSION_TOKEN
     elif [ -n "$COGNITO_ACCESS_KEY" ]; then
-        print_info "Using Cognito unauthenticated credentials (temporary)"
+        if [ -n "$COGNITO_CLIENT_ID" ]; then
+            print_info "Using Cognito authenticated credentials (temporary)"
+        else
+            print_info "Using Cognito unauthenticated credentials (temporary)"
+        fi
         export AWS_ACCESS_KEY_ID="$COGNITO_ACCESS_KEY"
         export AWS_SECRET_ACCESS_KEY="$COGNITO_SECRET_KEY"
         export AWS_SESSION_TOKEN="$COGNITO_SESSION_TOKEN"
@@ -2438,13 +3146,44 @@ main() {
         test_cognito_unauth_access || true
     fi
     
+    # Step 2b: Cognito User Pool client authentication
+    if [ -n "$COGNITO_CLIENT_ID" ]; then
+        test_cognito_client_auth || true
+    fi
+    
     # Step 3: Setup credentials (uses best available)
     if ! setup_credentials; then
+        if [ -n "$OAUTH2_ACCESS_TOKEN" ]; then
+            print_warning "No IAM credentials available, but Bearer token was obtained"
+            print_info "Switching to Bearer token enumeration mode"
+
+            enumerate_with_bearer_token
+
+            print_section "TESTING COMPLETE (BEARER TOKEN MODE)"
+            print_success "All results saved to: $OUTPUT_DIR"
+            print_info "Key files to review:"
+            echo "  - $OUTPUT_DIR/cognito_oauth2_token.json"
+            [ -f "$OUTPUT_DIR/jwt_claims.json" ] && echo "  - $OUTPUT_DIR/jwt_claims.json"
+            [ -f "$OUTPUT_DIR/cognito_userinfo.json" ] && echo "  - $OUTPUT_DIR/cognito_userinfo.json"
+            [ -f "$OUTPUT_DIR/oidc_configuration.json" ] && echo "  - $OUTPUT_DIR/oidc_configuration.json"
+            [ -f "$OUTPUT_DIR/cognito_jwks.json" ] && echo "  - $OUTPUT_DIR/cognito_jwks.json"
+            [ -f "$OUTPUT_DIR/cognito_user_enum.txt" ] && echo "  - $OUTPUT_DIR/cognito_user_enum.txt"
+            [ -f "$OUTPUT_DIR/cognito_signup_probe.json" ] && echo "  - $OUTPUT_DIR/cognito_signup_probe.json"
+            [ -f "$OUTPUT_DIR/cognito_client_details.json" ] && echo "  - $OUTPUT_DIR/cognito_client_details.json"
+            [ -f "$OUTPUT_DIR/cognito_pool_clients.json" ] && echo "  - $OUTPUT_DIR/cognito_pool_clients.json"
+            echo ""
+            print_info "No IAM credentials were available for full AWS service enumeration."
+            print_info "To also run IAM-based enumeration, provide an Identity Pool (-p) with"
+            print_info "--username/--password, or supply IAM keys directly (-a, -s)."
+            return 0
+        fi
+
         print_error "No valid credentials available. Exiting."
         print_info "Provide credentials via:"
         print_info "  - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)"
         print_info "  - Command line arguments (-a, -s)"
         print_info "  - Cognito Identity Pool (-p)"
+        print_info "  - Cognito client credentials (--client-id, --client-secret, --token-url)"
         print_info "  - Encoded credentials string (-e)"
         exit 1
     fi
