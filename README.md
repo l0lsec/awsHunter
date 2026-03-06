@@ -12,7 +12,7 @@ A comprehensive bash script for testing AWS security misconfigurations, credenti
 ## Author
 
 **Sedric Louissaint**  
-🐦 Twitter: [@l0lsec](https://twitter.com/l0lsec)  
+🐦 Twitter: [@l0lsec](https://twitter.com/sedric____)  
 💻 GitHub: l0lsec
 
 ---
